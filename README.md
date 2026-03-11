@@ -7,7 +7,10 @@
 - Rate-limited to prevent abuse
 
 ## Screenshots
-[Add 2-3 screenshots of the dashboard showing results]
+<img width="989" height="651" alt="image" src="https://github.com/user-attachments/assets/4cde1b6f-7c11-4eda-93f4-86facc959163" />
+<img width="1234" height="791" alt="image" src="https://github.com/user-attachments/assets/f8b32c27-32df-44af-9951-d96ed2fab11e" />
+<img width="913" height="857" alt="image" src="https://github.com/user-attachments/assets/53bd5c0c-641e-4365-880b-e39e39938948" />
+
 
 ## Architecture
 - **Frontend:** Next.js + React + TypeScript
