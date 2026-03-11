@@ -5,7 +5,41 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const requestCounts: { [key: string]: { count: number; resetTime: number } } =
+  {};
+
+function getRateLimitKey(request: NextRequest): string {
+  return request.headers.get('x-forwarded-for') || 'unknown';
+}
+
+function checkRateLimit(key: string): boolean {
+  const now = Date.now();
+  const entry = requestCounts[key];
+
+  // Reset or initialize the counter if missing or expired
+  if (!entry || now > entry.resetTime) {
+    requestCounts[key] = { count: 1, resetTime: now + 60_000 }; // 1 minute
+    return true;
+  }
+
+  // Max 10 requests per minute
+  if (entry.count >= 10) {
+    return false;
+  }
+
+  entry.count++;
+  return true;
+}
+
 export async function POST(request: NextRequest) {
+  const rateLimitKey = getRateLimitKey(request);
+  if (!checkRateLimit(rateLimitKey)) {
+    return NextResponse.json(
+      { error: 'Rate limit exceeded. Max 10 requests per minute.' },
+      { status: 429 },
+    );
+  }
+
   try {
     const { code } = await request.json();
 
