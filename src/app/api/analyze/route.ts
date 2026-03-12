@@ -1,57 +1,215 @@
 import OpenAI from 'openai';
 import { NextRequest, NextResponse } from 'next/server';
 
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_REQUESTS_PER_WINDOW = 10;
+const MAX_CODE_BYTES = 50_000;
+const MAX_TRACKED_CLIENTS = 5_000;
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+  timeout: 20_000,
 });
 
-const requestCounts: { [key: string]: { count: number; resetTime: number } } =
-  {};
+type RateLimitEntry = {
+  count: number;
+  resetTime: number;
+};
+
+type RefactoringSuggestion = {
+  severity: 'high' | 'medium' | 'low';
+  suggestion: string;
+};
+
+type AnalysisResult = {
+  overall_score: number;
+  architecture_score: number;
+  readability_score: number;
+  performance_score: number;
+  summary: string;
+  patterns_detected: string[];
+  performance_concerns: string[];
+  refactoring_suggestions: RefactoringSuggestion[];
+};
+
+const requestCounts = new Map<string, RateLimitEntry>();
+
+function jsonNoCache(body: unknown, status: number): NextResponse {
+  const response = NextResponse.json(body, { status });
+  response.headers.set(
+    'Cache-Control',
+    'no-store, no-cache, must-revalidate, proxy-revalidate',
+  );
+  response.headers.set('Pragma', 'no-cache');
+  response.headers.set('Expires', '0');
+  response.headers.set('X-Content-Type-Options', 'nosniff');
+
+  return response;
+}
 
 function getRateLimitKey(request: NextRequest): string {
-  return request.headers.get('x-forwarded-for') || 'unknown';
+  const xForwardedFor = request.headers.get('x-forwarded-for');
+  const xRealIp = request.headers.get('x-real-ip');
+  const cfConnectingIp = request.headers.get('cf-connecting-ip');
+
+  const forwardedIp = xForwardedFor?.split(',')[0]?.trim();
+  const rawIp = forwardedIp || cfConnectingIp || xRealIp || 'unknown';
+
+  // Bound key length to avoid unbounded memory usage from crafted headers.
+  return rawIp.slice(0, 128);
+}
+
+function cleanupExpiredRateLimits(now: number): void {
+  for (const [key, value] of requestCounts.entries()) {
+    if (now > value.resetTime) {
+      requestCounts.delete(key);
+    }
+  }
 }
 
 function checkRateLimit(key: string): boolean {
   const now = Date.now();
-  const entry = requestCounts[key];
+  const entry = requestCounts.get(key);
+
+  if (requestCounts.size > MAX_TRACKED_CLIENTS) {
+    cleanupExpiredRateLimits(now);
+  }
 
   // Reset or initialize the counter if missing or expired
   if (!entry || now > entry.resetTime) {
-    requestCounts[key] = { count: 1, resetTime: now + 60_000 }; // 1 minute
+    requestCounts.set(key, {
+      count: 1,
+      resetTime: now + RATE_LIMIT_WINDOW_MS,
+    });
     return true;
   }
 
   // Max 10 requests per minute
-  if (entry.count >= 10) {
+  if (entry.count >= MAX_REQUESTS_PER_WINDOW) {
     return false;
   }
 
   entry.count++;
+  requestCounts.set(key, entry);
   return true;
 }
 
+function isScore(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= 100
+  );
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) && value.every((item) => typeof item === 'string')
+  );
+}
+
+function isRefactoringSuggestionArray(
+  value: unknown,
+): value is RefactoringSuggestion[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        item &&
+        typeof item === 'object' &&
+        'severity' in item &&
+        'suggestion' in item &&
+        (item.severity === 'high' ||
+          item.severity === 'medium' ||
+          item.severity === 'low') &&
+        typeof item.suggestion === 'string',
+    )
+  );
+}
+
+function isAnalysisResult(value: unknown): value is AnalysisResult {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+
+  return (
+    isScore(candidate.overall_score) &&
+    isScore(candidate.architecture_score) &&
+    isScore(candidate.readability_score) &&
+    isScore(candidate.performance_score) &&
+    typeof candidate.summary === 'string' &&
+    candidate.summary.trim().length > 0 &&
+    isStringArray(candidate.patterns_detected) &&
+    isStringArray(candidate.performance_concerns) &&
+    isRefactoringSuggestionArray(candidate.refactoring_suggestions)
+  );
+}
+
+function parseModelJson(text: string): unknown {
+  const trimmed = text.trim();
+  const withoutFences = trimmed.startsWith('```')
+    ? trimmed.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')
+    : trimmed;
+
+  return JSON.parse(withoutFences);
+}
+
 export async function POST(request: NextRequest) {
+  if (!process.env.OPENAI_API_KEY) {
+    console.error('OPENAI_API_KEY is not configured');
+    return jsonNoCache({ error: 'Analysis service is not configured.' }, 500);
+  }
+
+  const contentType = request.headers.get('content-type') || '';
+  if (!contentType.toLowerCase().includes('application/json')) {
+    return jsonNoCache(
+      { error: 'Content-Type must be application/json.' },
+      415,
+    );
+  }
+
   const rateLimitKey = getRateLimitKey(request);
   if (!checkRateLimit(rateLimitKey)) {
-    return NextResponse.json(
-      { error: 'Rate limit exceeded. Max 10 requests per minute.' },
-      { status: 429 },
+    return jsonNoCache(
+      {
+        error: `Rate limit exceeded. Max ${MAX_REQUESTS_PER_WINDOW} requests per minute.`,
+      },
+      429,
     );
   }
 
   try {
-    const { code } = await request.json();
-
-    // Validation
-    if (!code || code.length === 0) {
-      return NextResponse.json({ error: 'No code provided' }, { status: 400 });
+    let payload: unknown;
+    try {
+      payload = await request.json();
+    } catch {
+      return jsonNoCache({ error: 'Invalid JSON payload.' }, 400);
     }
 
-    if (code.length > 50000) {
-      return NextResponse.json(
-        { error: 'Code too large (max 50KB)' },
-        { status: 400 },
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return jsonNoCache({ error: 'Request body must be a JSON object.' }, 400);
+    }
+
+    const { code } = payload as { code?: unknown };
+
+    // Validation
+    if (typeof code !== 'string') {
+      return jsonNoCache({ error: '"code" must be a string.' }, 400);
+    }
+
+    const trimmedCode = code.trim();
+    if (!trimmedCode) {
+      return jsonNoCache({ error: 'No code provided.' }, 400);
+    }
+
+    const codeByteLength = new TextEncoder().encode(trimmedCode).length;
+    if (codeByteLength > MAX_CODE_BYTES) {
+      return jsonNoCache(
+        { error: `Code too large (max ${MAX_CODE_BYTES / 1000}KB).` },
+        400,
       );
     }
 
@@ -60,7 +218,7 @@ export async function POST(request: NextRequest) {
 
 Code to analyze:
 \`\`\`
-${code}
+${trimmedCode}
 \`\`\`
 
 Return ONLY this JSON structure (no additional text before or after):
@@ -82,6 +240,8 @@ Return ONLY this JSON structure (no additional text before or after):
     const message = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       max_tokens: 1024,
+      temperature: 0,
+      response_format: { type: 'json_object' },
       messages: [
         {
           role: 'user',
@@ -91,64 +251,68 @@ Return ONLY this JSON structure (no additional text before or after):
     });
 
     // Extract text from response
-    const responseText = message.choices[0].message.content || '';
+    const responseText = message.choices[0]?.message?.content;
+    if (!responseText || typeof responseText !== 'string') {
+      return jsonNoCache(
+        { error: 'Analysis service returned an empty response.' },
+        502,
+      );
+    }
 
     // Parse JSON response
-    let results;
+    let results: unknown;
     try {
-      results = JSON.parse(responseText);
-    } catch (parseError) {
-      console.error('Failed to parse OpenAI response:', responseText);
-      return NextResponse.json(
-        { error: 'Failed to parse analysis results' },
-        { status: 500 },
+      results = parseModelJson(responseText);
+    } catch {
+      console.error('Failed to parse model response JSON');
+      return jsonNoCache(
+        { error: 'Analysis service returned an invalid format.' },
+        502,
       );
     }
 
     // Validate response structure
-    if (!results.overall_score || !results.architecture_score) {
-      return NextResponse.json(
-        { error: 'Invalid analysis response structure' },
-        { status: 500 },
+    if (!isAnalysisResult(results)) {
+      return jsonNoCache(
+        { error: 'Analysis service returned an unexpected structure.' },
+        502,
       );
     }
 
-    const response = NextResponse.json(results);
-
-    response.headers.set(
-      'Cache-Control',
-      'no-store, no-cache, must-revalidate, proxy-revalidate',
-    );
-    response.headers.set('Pragma', 'no-cache');
-    response.headers.set('Expires', '0');
-
-    return response;
+    return jsonNoCache(results, 200);
   } catch (error) {
     console.error('Analysis error:', error);
 
-    const errorMessage =
-      error instanceof Error ? error.message : 'Unknown error';
+    if (error instanceof OpenAI.APIError) {
+      if (error.status === 401 || error.status === 403) {
+        return jsonNoCache(
+          { error: 'Analysis service authentication failed.' },
+          502,
+        );
+      }
 
-    if (
-      errorMessage.includes('authentication') ||
-      errorMessage.includes('401')
-    ) {
-      return NextResponse.json(
-        { error: 'OpenAI API key not configured or invalid' },
-        { status: 401 },
+      if (error.status === 429) {
+        return jsonNoCache(
+          { error: 'Analysis service is busy. Try again shortly.' },
+          503,
+        );
+      }
+
+      if (typeof error.status === 'number' && error.status >= 500) {
+        return jsonNoCache(
+          { error: 'Analysis service temporarily unavailable.' },
+          503,
+        );
+      }
+    }
+
+    if (error instanceof Error && error.name === 'AbortError') {
+      return jsonNoCache(
+        { error: 'Analysis request timed out. Try again.' },
+        504,
       );
     }
 
-    if (errorMessage.includes('insufficient_quota')) {
-      return NextResponse.json(
-        { error: 'OpenAI account has insufficient quota. Add payment method.' },
-        { status: 402 },
-      );
-    }
-
-    return NextResponse.json(
-      { error: 'Failed to analyze code: ' + errorMessage },
-      { status: 500 },
-    );
+    return jsonNoCache({ error: 'Failed to analyze code.' }, 500);
   }
 }
