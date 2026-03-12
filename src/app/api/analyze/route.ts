@@ -5,6 +5,8 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 const MAX_REQUESTS_PER_WINDOW = 10;
 const MAX_CODE_BYTES = 50_000;
 const MAX_TRACKED_CLIENTS = 5_000;
+const ANALYZE_PROVIDER = 'openai';
+const ANALYZE_ROUTE_VERSION = '2026-03-11-v2';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -43,6 +45,8 @@ function jsonNoCache(body: unknown, status: number): NextResponse {
   response.headers.set('Pragma', 'no-cache');
   response.headers.set('Expires', '0');
   response.headers.set('X-Content-Type-Options', 'nosniff');
+  response.headers.set('X-Analyze-Provider', ANALYZE_PROVIDER);
+  response.headers.set('X-Analyze-Route-Version', ANALYZE_ROUTE_VERSION);
 
   return response;
 }

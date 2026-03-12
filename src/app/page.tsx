@@ -93,10 +93,11 @@ export default function Home() {
           </h2>
 
           <textarea
+            key='input_ta'
             value={code}
             onChange={(e) => setCode(e.target.value)}
             placeholder='Paste your code here... (Max 50KB)'
-            className='w-full h-64 p-4 border-2 border-gray-300 rounded-lg font-mono text-sm focus:outline-none focus:border-blue-500 resize-vertical'
+            className='w-full h-64 p-4 bg-white text-gray-900 placeholder:text-gray-500 placeholder:opacity-100 border-2 border-gray-300 rounded-lg font-mono text-sm focus:outline-none focus:border-blue-500 resize-vertical'
           />
 
           <button
