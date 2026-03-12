@@ -33,7 +33,7 @@ vi.mock('openai', () => {
   return { default: OpenAI };
 });
 
-import { POST } from './route';
+import { GET, POST } from './route';
 
 let ipCounter = 0;
 
@@ -79,7 +79,38 @@ const validModelResponse = {
 describe('POST /api/analyze', () => {
   beforeEach(() => {
     process.env.OPENAI_API_KEY = 'test-key';
+    process.env.ANTHROPIC_API_KEY = '';
+    process.env.ADMIN_DEBUG_TOKEN = 'debug-secret';
     mockCreate.mockReset();
+  });
+
+  it('returns 404 for debug endpoint without admin token', async () => {
+    const response = await GET(makeRequest({}));
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({
+      error: 'Not found',
+    });
+  });
+
+  it('returns masked env status for debug endpoint with valid token', async () => {
+    const req = makeRequest({}, { ip: '203.0.113.9' });
+    req.headers.set('x-admin-debug-token', 'debug-secret');
+
+    const response = await GET(req);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload).toEqual(
+      expect.objectContaining({
+        ok: true,
+        provider: 'openai',
+        routeVersion: '2026-03-11-v2',
+        hasOpenAIKey: true,
+        hasAnthropicKey: false,
+      }),
+    );
+    expect(typeof payload.timestamp).toBe('string');
   });
 
   it('returns 415 for non-json content type', async () => {

@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { NextRequest, NextResponse } from 'next/server';
+import { timingSafeEqual } from 'node:crypto';
 
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const MAX_REQUESTS_PER_WINDOW = 10;
@@ -7,6 +8,7 @@ const MAX_CODE_BYTES = 50_000;
 const MAX_TRACKED_CLIENTS = 5_000;
 const ANALYZE_PROVIDER = 'openai';
 const ANALYZE_ROUTE_VERSION = '2026-03-11-v2';
+const ADMIN_DEBUG_HEADER = 'x-admin-debug-token';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -159,6 +161,50 @@ function parseModelJson(text: string): unknown {
     : trimmed;
 
   return JSON.parse(withoutFences);
+}
+
+function safeCompareToken(provided: string, expected: string): boolean {
+  const providedBuffer = Buffer.from(provided);
+  const expectedBuffer = Buffer.from(expected);
+
+  if (providedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(providedBuffer, expectedBuffer);
+}
+
+function isAdminDebugAuthorized(request: NextRequest): boolean {
+  const configuredToken = process.env.ADMIN_DEBUG_TOKEN?.trim();
+  if (!configuredToken) {
+    return false;
+  }
+
+  const providedToken = request.headers.get(ADMIN_DEBUG_HEADER)?.trim();
+  if (!providedToken) {
+    return false;
+  }
+
+  return safeCompareToken(providedToken, configuredToken);
+}
+
+export async function GET(request: NextRequest) {
+  if (!isAdminDebugAuthorized(request)) {
+    return jsonNoCache({ error: 'Not found' }, 404);
+  }
+
+  return jsonNoCache(
+    {
+      ok: true,
+      provider: ANALYZE_PROVIDER,
+      routeVersion: ANALYZE_ROUTE_VERSION,
+      hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY?.trim()),
+      hasAnthropicKey: Boolean(process.env.ANTHROPIC_API_KEY?.trim()),
+      nodeEnv: process.env.NODE_ENV || 'unknown',
+      timestamp: new Date().toISOString(),
+    },
+    200,
+  );
 }
 
 export async function POST(request: NextRequest) {
